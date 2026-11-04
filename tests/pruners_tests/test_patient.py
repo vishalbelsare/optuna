@@ -1,4 +1,6 @@
-from typing import List
+from __future__ import annotations
+
+from typing import Literal
 
 import pytest
 
@@ -11,7 +13,6 @@ def test_patient_pruner_experimental_warning() -> None:
 
 
 def test_patient_pruner_patience() -> None:
-
     optuna.pruners.PatientPruner(None, 0)
     optuna.pruners.PatientPruner(None, 1)
 
@@ -20,7 +21,6 @@ def test_patient_pruner_patience() -> None:
 
 
 def test_patient_pruner_min_delta() -> None:
-
     optuna.pruners.PatientPruner(None, 0, 0.0)
     optuna.pruners.PatientPruner(None, 0, 1.0)
 
@@ -29,7 +29,6 @@ def test_patient_pruner_min_delta() -> None:
 
 
 def test_patient_pruner_with_one_trial() -> None:
-
     pruner = optuna.pruners.PatientPruner(None, 0)
     study = optuna.study.create_study(pruner=pruner)
     trial = study.ask()
@@ -39,8 +38,8 @@ def test_patient_pruner_with_one_trial() -> None:
     assert not trial.should_prune()
 
 
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 def test_patient_pruner_intermediate_values_nan() -> None:
-
     pruner = optuna.pruners.PatientPruner(None, 0, 0)
     study = optuna.study.create_study(pruner=pruner)
 
@@ -78,9 +77,9 @@ def test_patient_pruner_intermediate_values_nan() -> None:
 def test_patient_pruner_intermediate_values(
     patience: int,
     min_delta: float,
-    direction: str,
-    intermediates: List[int],
-    expected_prune_steps: List[int],
+    direction: Literal["minimize", "maximize"],
+    intermediates: list[int],
+    expected_prune_steps: list[int],
 ) -> None:
     pruner = optuna.pruners.PatientPruner(None, patience, min_delta)
     study = optuna.study.create_study(pruner=pruner, direction=direction)

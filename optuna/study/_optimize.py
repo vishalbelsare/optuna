@@ -1,38 +1,37 @@
+from __future__ import annotations
+
 from concurrent.futures import FIRST_COMPLETED
-from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
 import copy
 import datetime
 import gc
 import itertools
-import math
 import os
 import sys
-from threading import Event
-from threading import Thread
-from typing import Any
-from typing import Callable
-from typing import cast
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Set
-from typing import Tuple
-from typing import Type
-from typing import Union
+from typing import TYPE_CHECKING
 import warnings
 
 import optuna
 from optuna import exceptions
 from optuna import logging
 from optuna import progress_bar as pbar_module
-from optuna import storages
-from optuna import trial as trial_module
+from optuna._warnings import optuna_warn
 from optuna.exceptions import ExperimentalWarning
-from optuna.trial import FrozenTrial
+from optuna.storages._heartbeat import get_heartbeat_thread
+from optuna.storages._heartbeat import is_heartbeat_enabled
+from optuna.study._tell import _tell_with_warning
 from optuna.trial import TrialState
 
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterable
+    from collections.abc import Sequence
+    from concurrent.futures import Future
+    from typing import Any
+
+    from optuna.trial import FrozenTrial
 
 _logger = logging.get_logger(__name__)
 
@@ -40,24 +39,27 @@ _logger = logging.get_logger(__name__)
 def _optimize(
     study: "optuna.Study",
     func: "optuna.study.study.ObjectiveFuncType",
-    n_trials: Optional[int] = None,
-    timeout: Optional[float] = None,
+    n_trials: int | None = None,
+    timeout: float | None = None,
     n_jobs: int = 1,
-    catch: Tuple[Type[Exception], ...] = (),
-    callbacks: Optional[List[Callable[["optuna.Study", FrozenTrial], None]]] = None,
+    catch: tuple[type[Exception], ...] = (),
+    callbacks: Iterable[Callable[["optuna.Study", FrozenTrial], None]] | None = None,
     gc_after_trial: bool = False,
     show_progress_bar: bool = False,
 ) -> None:
     if not isinstance(catch, tuple):
         raise TypeError(
-            "The catch argument is of type '{}' but must be a tuple.".format(type(catch).__name__)
+            f"The catch argument is of type '{type(catch).__name__}' but must be a tuple."
         )
 
-    if not study._optimize_lock.acquire(False):
+    if study._thread_local.in_optimize_loop:
         raise RuntimeError("Nested invocation of `Study.optimize` method isn't allowed.")
 
-    # TODO(crcrpar): Make progress bar work when n_jobs != 1.
-    progress_bar = pbar_module._ProgressBar(show_progress_bar and n_jobs == 1, n_trials, timeout)
+    if show_progress_bar and n_trials is None and timeout is not None and n_jobs != 1:
+        optuna_warn("The timeout-based progress bar is not supported with n_jobs != 1.")
+        show_progress_bar = False
+
+    progress_bar = pbar_module._ProgressBar(show_progress_bar, n_trials, timeout)
 
     study._stop_flag = False
 
@@ -76,14 +78,11 @@ def _optimize(
                 progress_bar=progress_bar,
             )
         else:
-            if show_progress_bar:
-                warnings.warn("Progress bar only supports serial execution (`n_jobs=1`).")
-
             if n_jobs == -1:
                 n_jobs = os.cpu_count() or 1
 
             time_start = datetime.datetime.now()
-            futures: Set[Future] = set()
+            futures: set[Future] = set()
 
             with ThreadPoolExecutor(max_workers=n_jobs) as executor:
                 for n_submitted_trials in itertools.count():
@@ -117,26 +116,33 @@ def _optimize(
                             gc_after_trial,
                             True,
                             time_start,
-                            None,
+                            progress_bar,
                         )
                     )
+
+                # Raise if an exception occurred in any remaining future.
+                for f in futures:
+                    f.result()
     finally:
-        study._optimize_lock.release()
+        study._thread_local.in_optimize_loop = False
         progress_bar.close()
 
 
 def _optimize_sequential(
     study: "optuna.Study",
     func: "optuna.study.study.ObjectiveFuncType",
-    n_trials: Optional[int],
-    timeout: Optional[float],
-    catch: Tuple[Type[Exception], ...],
-    callbacks: Optional[List[Callable[["optuna.Study", FrozenTrial], None]]],
+    n_trials: int | None,
+    timeout: float | None,
+    catch: tuple[type[Exception], ...],
+    callbacks: Iterable[Callable[["optuna.Study", FrozenTrial], None]] | None,
     gc_after_trial: bool,
     reseed_sampler_rng: bool,
-    time_start: Optional[datetime.datetime],
-    progress_bar: Optional[pbar_module._ProgressBar],
+    time_start: datetime.datetime | None,
+    progress_bar: pbar_module._ProgressBar | None,
 ) -> None:
+    # Here we set `in_optimize_loop = True`, not at the beginning of the `_optimize()` function.
+    # Because it is a thread-local object and `n_jobs` option spawns new threads.
+    study._thread_local.in_optimize_loop = True
     if reseed_sampler_rng:
         study.sampler.reseed_rng()
 
@@ -160,24 +166,23 @@ def _optimize_sequential(
                 break
 
         try:
-            trial = _run_trial(study, func, catch)
-        except Exception:
-            raise
+            frozen_trial_id = _run_trial(study, func, catch)
         finally:
             # The following line mitigates memory problems that can be occurred in some
-            # environments (e.g., services that use computing containers such as CircleCI).
+            # environments (e.g., services that use computing containers such as GitHub Actions).
             # Please refer to the following PR for further details:
             # https://github.com/optuna/optuna/pull/325.
             if gc_after_trial:
                 gc.collect()
 
         if callbacks is not None:
-            frozen_trial = copy.deepcopy(study._storage.get_trial(trial._trial_id))
+            frozen_trial = study._storage.get_trial(frozen_trial_id)
             for callback in callbacks:
-                callback(study, frozen_trial)
+                callback(study, copy.deepcopy(frozen_trial))
 
         if progress_bar is not None:
-            progress_bar.update((datetime.datetime.now() - time_start).total_seconds())
+            elapsed_seconds = (datetime.datetime.now() - time_start).total_seconds()
+            progress_bar.update(elapsed_seconds, study)
 
     study._storage.remove_session()
 
@@ -185,151 +190,97 @@ def _optimize_sequential(
 def _run_trial(
     study: "optuna.Study",
     func: "optuna.study.study.ObjectiveFuncType",
-    catch: Tuple[Type[Exception], ...],
-) -> trial_module.Trial:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ExperimentalWarning)
-        optuna.storages.fail_stale_trials(study)
+    catch: tuple[type[Exception], ...],
+) -> int:
+    if is_heartbeat_enabled(study._storage):
+        with warnings.catch_warnings():
+            # Ignore ExperimentalWarning when using fail_stale_trials internally.
+            warnings.simplefilter("ignore", ExperimentalWarning)
+            optuna.storages.fail_stale_trials(study)
 
     trial = study.ask()
 
-    state: Optional[TrialState] = None
-    values: Optional[List[float]] = None
-    func_err: Optional[Exception] = None
-    func_err_fail_exc_info: Optional[Any] = None
-    # Set to a string if `func` returns correctly but the return value violates assumptions.
-    values_conversion_failure_message: Optional[str] = None
-    stop_event: Optional[Event] = None
-    thread: Optional[Thread] = None
+    state: TrialState | None = None
+    value_or_values: float | Sequence[float] | None = None
+    func_err: Exception | KeyboardInterrupt | None = None
+    func_err_fail_exc_info: Any | None = None
 
-    if study._storage.is_heartbeat_enabled():
-        stop_event = Event()
-        thread = Thread(
-            target=_record_heartbeat, args=(trial._trial_id, study._storage, stop_event)
-        )
-        thread.start()
-
-    try:
-        value_or_values = func(trial)
-    except exceptions.TrialPruned as e:
-        # TODO(mamu): Handle multi-objective cases.
-        state = TrialState.PRUNED
-        func_err = e
-    except Exception as e:
-        state = TrialState.FAIL
-        func_err = e
-        func_err_fail_exc_info = sys.exc_info()
-    else:
-        # TODO(hvy): Avoid checking the values both here and inside `Study.tell`.
-        values, values_conversion_failure_message = _check_and_convert_to_values(
-            len(study.directions), value_or_values, trial.number
-        )
-        if values_conversion_failure_message is not None:
+    with get_heartbeat_thread(trial._trial_id, study._storage):
+        try:
+            value_or_values = func(trial)
+        except exceptions.TrialPruned as e:
+            # TODO(mamu): Handle multi-objective cases.
+            state = TrialState.PRUNED
+            func_err = e
+        except (Exception, KeyboardInterrupt) as e:
             state = TrialState.FAIL
-        else:
-            state = TrialState.COMPLETE
+            func_err = e
+            func_err_fail_exc_info = sys.exc_info()
 
-    if study._storage.is_heartbeat_enabled():
-        assert stop_event is not None
-        assert thread is not None
-        stop_event.set()
-        thread.join()
-
-    # `Study.tell` may raise during trial post-processing.
+    # `_tell_with_warning` may raise during trial post-processing.
     try:
-        study.tell(trial, values=values, state=state)
+        updated_state, values, warning_message = _tell_with_warning(
+            study=study,
+            trial=trial,
+            value_or_values=value_or_values,
+            state=state,
+            suppress_warning=True,
+        )
     except Exception:
+        frozen_trial = study._storage.get_trial(trial._trial_id)
+        updated_state = frozen_trial.state
+        values = frozen_trial.values
+        warning_message = None
         raise
     finally:
-        if state == TrialState.COMPLETE:
-            study._log_completed_trial(trial, cast(List[float], values))
-        elif state == TrialState.PRUNED:
-            _logger.info("Trial {} pruned. {}".format(trial.number, str(func_err)))
-        elif state == TrialState.FAIL:
+        if updated_state == TrialState.COMPLETE:
+            assert values is not None
+            study._log_completed_trial(values, trial.number, trial.params)
+        elif updated_state == TrialState.PRUNED:
+            _logger.info(f"Trial {trial.number} pruned. {str(func_err)}")
+        elif updated_state == TrialState.FAIL:
             if func_err is not None:
-                _logger.warning(
-                    "Trial {} failed because of the following error: {}".format(
-                        trial.number, repr(func_err)
-                    ),
+                _log_failed_trial(
+                    trial.number,
+                    trial.params,
+                    repr(func_err),
                     exc_info=func_err_fail_exc_info,
+                    value_or_values=value_or_values,
                 )
-            elif values_conversion_failure_message is not None:
-                _logger.warning(values_conversion_failure_message)
+            elif warning_message is not None:
+                _log_failed_trial(
+                    trial.number,
+                    trial.params,
+                    warning_message,
+                    value_or_values=value_or_values,
+                )
             else:
                 assert False, "Should not reach."
         else:
             assert False, "Should not reach."
 
-    if state == TrialState.FAIL and func_err is not None and not isinstance(func_err, catch):
-        raise func_err
-    return trial
-
-
-def _check_and_convert_to_values(
-    n_objectives: int, original_value: Union[float, Sequence[float]], trial_number: int
-) -> Tuple[Optional[List[float]], Optional[str]]:
-    if isinstance(original_value, Sequence):
-        if n_objectives != len(original_value):
-            return (
-                None,
-                (
-                    f"Trial {trial_number} failed, because the number of the values "
-                    f"{len(original_value)} did not match the number of the objectives "
-                    f"{n_objectives}."
-                ),
-            )
-        else:
-            _original_values = list(original_value)
-    else:
-        _original_values = [original_value]
-
-    _checked_values = []
-    for v in _original_values:
-        checked_v, failure_message = _check_single_value(v, trial_number)
-        if failure_message is not None:
-            # TODO(Imamura): Construct error message taking into account all values and do not
-            #  early return
-            # `value` is assumed to be ignored on failure so we can set it to any value.
-            return None, failure_message
-        elif isinstance(checked_v, float):
-            _checked_values.append(checked_v)
-        else:
-            assert False
-
-    return _checked_values, None
-
-
-def _check_single_value(
-    original_value: float, trial_number: int
-) -> Tuple[Optional[float], Optional[str]]:
-    value = None
-    failure_message = None
-
-    try:
-        value = float(original_value)
-    except (
-        ValueError,
-        TypeError,
+    if (
+        updated_state == TrialState.FAIL
+        and func_err is not None
+        and not isinstance(func_err, catch)
     ):
-        failure_message = (
-            f"Trial {trial_number} failed, because the value {repr(original_value)} could not be "
-            "cast to float."
-        )
-
-    if value is not None and math.isnan(value):
-        value = None
-        failure_message = (
-            f"Trial {trial_number} failed, because the objective function returned "
-            f"{original_value}."
-        )
-
-    return value, failure_message
+        raise func_err
+    return trial._trial_id
 
 
-def _record_heartbeat(trial_id: int, storage: storages.BaseStorage, stop_event: Event) -> None:
-    heartbeat_interval = storage.get_heartbeat_interval()
-    assert heartbeat_interval is not None
-    while True:
-        storage.record_heartbeat(trial_id)
-        if stop_event.wait(timeout=heartbeat_interval):
-            return
+def _log_failed_trial(
+    trial_number: int,
+    trial_params: dict[str, Any],
+    message: str | Warning,
+    exc_info: Any = None,
+    value_or_values: Any = None,
+) -> None:
+    _logger.warning(
+        (
+            f"Trial {trial_number} failed with parameters: {trial_params} "
+            f"because of the following error: {message}."
+        ),
+        exc_info=exc_info,
+    )
+
+    _logger.warning(f"Trial {trial_number} failed with value {repr(value_or_values)}.")

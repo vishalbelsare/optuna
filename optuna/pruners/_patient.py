@@ -1,16 +1,30 @@
-from typing import Optional
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-import optuna
-from optuna._experimental import experimental
+from optuna._experimental import experimental_class
 from optuna.pruners import BasePruner
 from optuna.study._study_direction import StudyDirection
 
 
-@experimental("2.8.0")
+if TYPE_CHECKING:
+    import optuna
+
+
+@experimental_class("2.8.0")
 class PatientPruner(BasePruner):
     """Pruner which wraps another pruner with tolerance.
+
+    This pruner monitors intermediate values in a trial and prunes the trial if the improvement in
+    the intermediate values after a patience period is less than a threshold.
+
+    The pruner handles NaN values in the following manner:
+        1. If all intermediate values before or during the patient period are NaN, the trial will
+        not be pruned
+        2. During the pruning calculations, NaN values are ignored. Only valid numeric values are
+        considered.
 
     Example:
 
@@ -57,8 +71,10 @@ class PatientPruner(BasePruner):
             trial to be pruned. If it is :obj:`None`, this pruner is equivalent to
             early-stopping taken the intermediate values in the individual trial.
         patience:
-            Pruning is disabled until the objective doesn't improve for
-            ``patience`` consecutive steps.
+            Pruning is disabled until the objective doesn't improve for ``patience`` consecutive
+            reported steps. Note that patience counts the number of reported intermediate values
+            sequentially, rather than evaluating gaps between step numbers;
+            steps without a reported value are skipped and don't count toward patience.
         min_delta:
             Tolerance value to check whether or not the objective improves.
             This value should be non-negative.
@@ -66,9 +82,8 @@ class PatientPruner(BasePruner):
     """
 
     def __init__(
-        self, wrapped_pruner: Optional[BasePruner], patience: int, min_delta: float = 0.0
+        self, wrapped_pruner: BasePruner | None, patience: int, min_delta: float = 0.0
     ) -> None:
-
         if patience < 0:
             raise ValueError(f"patience cannot be negative but got {patience}.")
 
@@ -79,7 +94,7 @@ class PatientPruner(BasePruner):
         self._patience = patience
         self._min_delta = min_delta
 
-    def prune(self, study: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> bool:
+    def prune(self, study: optuna.study.Study, trial: optuna.trial.FrozenTrial) -> bool:
         step = trial.last_step
         if step is None:
             return False

@@ -28,7 +28,7 @@ Optuna has modern functionalities as follows:
 
 - :doc:`Easy parallelization <tutorial/10_key_features/004_distributed>`
 
-  - Scale studies to tens or hundreds or workers with little or no changes to the code.
+  - Scale studies to tens or hundreds of workers with little or no changes to the code.
 
 - :doc:`Quick visualization <tutorial/10_key_features/005_visualization>`
 
@@ -79,16 +79,50 @@ optimization *studies*.
     study = optuna.create_study()  # Create a new study.
     study.optimize(objective, n_trials=100)  # Invoke optimization of the objective function.
 
+Web Dashboard
+-------------
+
+`Optuna Dashboard <https://github.com/optuna/optuna-dashboard>`__ is a real-time web dashboard for Optuna.
+You can check the optimization history, hyperparameter importance, etc. in graphs and tables.
+You don't need to create a Python script to call `Optuna's visualization <https://optuna.readthedocs.io/en/stable/reference/visualization/index.html>`__ functions.
+Feature requests and bug reports are welcome!
+
+.. image:: https://user-images.githubusercontent.com/5564044/204975098-95c2cb8c-0fb5-4388-abc4-da32f56cb4e5.gif
+
+``optuna-dashboard`` can be installed via pip:
+
+.. code-block:: console
+
+   $ pip install optuna-dashboard
+
+.. TIP::
+
+   Please check out the `getting started <https://optuna-dashboard.readthedocs.io/en/stable/getting-started.html>`__ section of Optuna Dashboard's official documentation.
+
+OptunaHub
+---------
+
+`OptunaHub <https://hub.optuna.org/>`__ is a feature-sharing platform for Optuna.
+You can use the registered features and publish your packages.
+For more details, please refer to `the official documentation <https://optuna.github.io/optunahub/>`__.
+
+.. image:: ../image/optunahub-introduction.png
+  :width: 800px
+  :target: https://hub.optuna.org/
+
+``optunahub`` can be installed via pip:
+
+.. code-block:: console
+
+   $ pip install optunahub
+
+
 Communication
 -------------
 
+-  `GitHub Discussions <https://github.com/optuna/optuna/discussions>`__ for questions.
 -  `GitHub Issues <https://github.com/optuna/optuna/issues>`__ for bug
-   reports, feature requests and questions.
--  `Gitter <https://gitter.im/optuna/optuna>`__ for interactive chat
-   with developers.
--  `Stack
-   Overflow <https://stackoverflow.com/questions/tagged/optuna>`__ for
-   questions.
+   reports and feature requests.
 
 Contribution
 ------------
@@ -100,6 +134,14 @@ License
 -------
 
 MIT License (see `LICENSE <https://github.com/optuna/optuna/blob/master/LICENSE>`__).
+
+Optuna uses the codes from SciPy and fdlibm projects (see :doc:`Third-party License <license_thirdparty>`).
+
+Acknowledgement
+---------------
+
+Optuna is developed and maintained by `Preferred Networks <https://www.preferred.jp/en/>`__\ ™
+(PFN™) and `community contributors <https://github.com/optuna/optuna/graphs/contributors>`__.
 
 Reference
 ---------

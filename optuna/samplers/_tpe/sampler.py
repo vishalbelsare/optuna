@@ -1,49 +1,66 @@
+from __future__ import annotations
+
+from functools import lru_cache
+import json
 import math
 from typing import Any
-from typing import Callable
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Sequence
-from typing import Tuple
-from typing import Union
-import warnings
+from typing import cast
+from typing import TYPE_CHECKING
+from typing import TypeVar
 
 import numpy as np
 
-from optuna._hypervolume import WFG
-from optuna.distributions import BaseDistribution
-from optuna.exceptions import ExperimentalWarning
+from optuna import _deprecated
+from optuna._convert_positional_args import convert_positional_args
+from optuna._experimental import warn_experimental_argument
+from optuna._hypervolume.hssp import _solve_hssp
+from optuna._warnings import optuna_warn
 from optuna.logging import get_logger
+from optuna.samplers._base import _INDEPENDENT_SAMPLING_WARNING_TEMPLATE
+from optuna.samplers._base import _process_constraints_after_trial
 from optuna.samplers._base import BaseSampler
+from optuna.samplers._lazy_random_state import LazyRandomState
 from optuna.samplers._random import RandomSampler
-from optuna.samplers._search_space import IntersectionSearchSpace
-from optuna.samplers._search_space.group_decomposed import _GroupDecomposedSearchSpace
-from optuna.samplers._search_space.group_decomposed import _SearchSpaceGroup
 from optuna.samplers._tpe.parzen_estimator import _ParzenEstimator
 from optuna.samplers._tpe.parzen_estimator import _ParzenEstimatorParameters
-from optuna.study import Study
+from optuna.search_space import IntersectionSearchSpace
+from optuna.search_space.group_decomposed import _GroupDecomposedSearchSpace
+from optuna.search_space.group_decomposed import _SearchSpaceGroup
+from optuna.study._multi_objective import _fast_non_domination_rank
 from optuna.study._study_direction import StudyDirection
 from optuna.trial import FrozenTrial
 from optuna.trial import TrialState
 
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Sequence
+
+    from optuna.distributions import BaseDistribution
+    from optuna.study import Study
+
+
 EPS = 1e-12
 _logger = get_logger(__name__)
 
+_RELATIVE_PARAMS_KEY = "tpe:relative_params"
+# The value of system_attrs must be less than 2046 characters on RDBStorage.
+_SYSTEM_ATTR_MAX_LENGTH = 2045
+
 
 def default_gamma(x: int) -> int:
+    return min(math.ceil(0.1 * x), 25)
 
-    return min(int(np.ceil(0.1 * x)), 25)
+
+def default_gamma_multiobjective(x: int) -> int:
+    return math.ceil(0.1 * x)
 
 
 def hyperopt_default_gamma(x: int) -> int:
-
-    return min(int(np.ceil(0.25 * np.sqrt(x))), 25)
+    return min(math.ceil(0.25 * x**0.5), 25)
 
 
 def default_weights(x: int) -> np.ndarray:
-
     if x == 0:
         return np.asarray([])
     elif x < 25:
@@ -54,11 +71,21 @@ def default_weights(x: int) -> np.ndarray:
         return np.concatenate([ramp, flat], axis=0)
 
 
+_T = TypeVar("_T")
+
+
+def _warn_if_deprecated_argument(
+    name: str, value: _T | None, default: _T, d_ver: str, r_ver: str
+) -> _T:
+    if value is not None:
+        msg = _deprecated._DEPRECATION_WARNING_TEMPLATE.format(name=name, d_ver=d_ver, r_ver=r_ver)
+        optuna_warn(msg, FutureWarning)
+        return value
+    return default
+
+
 class TPESampler(BaseSampler):
     """Sampler using TPE (Tree-structured Parzen Estimator) algorithm.
-
-    This sampler is based on *independent sampling*.
-    See also :class:`~optuna.samplers.BaseSampler` for more details of 'independent sampling'.
 
     On each trial, for each parameter, TPE fits one Gaussian Mixture Model (GMM) ``l(x)`` to
     the set of parameter values associated with the best objective values, and another GMM
@@ -68,13 +95,39 @@ class TPESampler(BaseSampler):
     For further information about TPE algorithm, please refer to the following papers:
 
     - `Algorithms for Hyper-Parameter Optimization
-      <https://papers.nips.cc/paper/4443-algorithms-for-hyper-parameter-optimization.pdf>`_
+      <https://papers.nips.cc/paper/4443-algorithms-for-hyper-parameter-optimization.pdf>`__
     - `Making a Science of Model Search: Hyperparameter Optimization in Hundreds of
-      Dimensions for Vision Architectures <http://proceedings.mlr.press/v28/bergstra13.pdf>`_
-    - `Multiobjective tree-structured parzen estimator for computationally expensive optimization
-      problems <https://dl.acm.org/doi/10.1145/3377930.3389817>`_
+      Dimensions for Vision Architectures <http://proceedings.mlr.press/v28/bergstra13.pdf>`__
+    - `Tree-Structured Parzen Estimator: Understanding Its Algorithm Components and Their Roles for
+      Better Empirical Performance <https://arxiv.org/abs/2304.11127>`__
+
+    For multi-objective TPE (MOTPE), please refer to the following papers:
+
+    - `Multiobjective Tree-Structured Parzen Estimator for Computationally Expensive Optimization
+      Problems <https://doi.org/10.1145/3377930.3389817>`__
+    - `Multiobjective Tree-Structured Parzen Estimator <https://doi.org/10.1613/jair.1.13188>`__
+
+    For constrained TPE (c-TPE), please refer to the following papers:
+
+    - `Optuna Constrained Tree-Structured Parzen Estimator Is a Joint Density Generalization of
+      c-TPE <https://arxiv.org/abs/2606.09889>`__
+    - `c-TPE: Tree-structured Parzen Estimator with Inequality Constraints for Expensive
+      Hyperparameter Optimization <https://arxiv.org/abs/2211.14411>`__
+
+    The first paper explains how Optuna handles constraints, while the second provides the
+    background of constrained optimization for TPE in general. Notably, the Optuna algorithm
+    differs from the one proposed in the second paper. OptunaHub provides
+    `c-TPE proposed by the second paper <https://hub.optuna.org/samplers/ctpe/>`__.
+
+    Please also check our articles:
+
+    - `Significant Speed Up of Multi-Objective TPESampler in Optuna v4.0.0
+      <https://medium.com/optuna/significant-speed-up-of-multi-objective-tpesampler-in-optuna-v4-0-0-2bacdcd1d99b>`__
+    - `Multivariate TPE Makes Optuna Even More Powerful
+      <https://medium.com/optuna/multivariate-tpe-makes-optuna-even-more-powerful-63c4bfbaebe2>`__
 
     Example:
+        An example of a single-objective optimization is as follows:
 
         .. testcode::
 
@@ -84,70 +137,35 @@ class TPESampler(BaseSampler):
 
             def objective(trial):
                 x = trial.suggest_float("x", -10, 10)
-                return x ** 2
+                return x**2
 
 
             study = optuna.create_study(sampler=TPESampler())
             study.optimize(objective, n_trials=10)
 
+    .. note::
+        :class:`~optuna.samplers.TPESampler`, which became much faster in v4.0.0, c.f. `our article
+        <https://medium.com/optuna/significant-speed-up-of-multi-objective-tpesampler-in-optuna-v4-0-0-2bacdcd1d99b>`__,
+        can handle multi-objective optimization with many trials as well.
+
     Args:
-        consider_prior:
-            Enhance the stability of Parzen estimator by imposing a Gaussian prior when
-            :obj:`True`. The prior is only effective if the sampling distribution is
-            either :class:`~optuna.distributions.UniformDistribution`,
-            :class:`~optuna.distributions.DiscreteUniformDistribution`,
-            :class:`~optuna.distributions.LogUniformDistribution`,
-            :class:`~optuna.distributions.IntUniformDistribution`,
-            or :class:`~optuna.distributions.IntLogUniformDistribution`.
-        prior_weight:
-            The weight of the prior. This argument is used in
-            :class:`~optuna.distributions.UniformDistribution`,
-            :class:`~optuna.distributions.DiscreteUniformDistribution`,
-            :class:`~optuna.distributions.LogUniformDistribution`,
-            :class:`~optuna.distributions.IntUniformDistribution`,
-            :class:`~optuna.distributions.IntLogUniformDistribution`, and
-            :class:`~optuna.distributions.CategoricalDistribution`.
-        consider_magic_clip:
-            Enable a heuristic to limit the smallest variances of Gaussians used in
-            the Parzen estimator.
-        consider_endpoints:
-            Take endpoints of domains into account when calculating variances of Gaussians
-            in Parzen estimator. See the original paper for details on the heuristics
-            to calculate the variances.
         n_startup_trials:
             The random sampling is used instead of the TPE algorithm until the given number
             of trials finish in the same study.
         n_ei_candidates:
             Number of candidate samples used to calculate the expected improvement.
-        gamma:
-            A function that takes the number of finished trials and returns the number
-            of trials to form a density function for samples with low grains.
-            See the original paper for more details.
-        weights:
-            A function that takes the number of finished trials and returns a weight for them.
-            See `Making a Science of Model Search: Hyperparameter Optimization in Hundreds of
-            Dimensions for Vision Architectures <http://proceedings.mlr.press/v28/bergstra13.pdf>`_
-            for more details.
-
-            .. note::
-                In the multi-objective case, this argument is only used to compute the weights of
-                bad trials, i.e., trials to construct `g(x)` in the `paper
-                <https://papers.nips.cc/paper/4443-algorithms-for-hyper-parameter-optimization.pdf>`_
-                ). The weights of good trials, i.e., trials to construct `l(x)`, are computed by a
-                rule based on the hypervolume contribution proposed in the `paper of MOTPE
-                <https://dl.acm.org/doi/10.1145/3377930.3389817>`_.
         seed:
             Seed for random number generator.
         multivariate:
             If this is :obj:`True`, the multivariate TPE is used when suggesting parameters.
-            The multivariate TPE is reported to outperform the independent TPE. See `BOHB: Robust
-            and Efficient Hyperparameter Optimization at Scale
-            <http://proceedings.mlr.press/v80/falkner18a.html>`_ for more details.
-
-            .. note::
-                Added in v2.2.0 as an experimental feature. The interface may change in newer
-                versions without prior notice. See
-                https://github.com/optuna/optuna/releases/tag/v2.2.0.
+            The multivariate TPE is reported to outperform the independent TPE in single-objective
+            optimization. See `BOHB: Robust and Efficient Hyperparameter Optimization at Scale
+            <http://proceedings.mlr.press/v80/falkner18a.html>`__ and `our article
+            <https://medium.com/optuna/multivariate-tpe-makes-optuna-even-more-powerful-63c4bfbaebe2>`__
+            for more details.
+            If this is :obj:`None`, the value is automatically determined based on the number of
+            objectives: :obj:`True` for single-objective optimization and :obj:`False` for
+            multi-objective optimization.
         group:
             If this and ``multivariate`` are :obj:`True`, the multivariate TPE with the group
             decomposed search space is used when suggesting parameters.
@@ -158,6 +176,7 @@ class TPESampler(BaseSampler):
             for a trial in completed trials, the intersection of the subspace and the search space
             of the trial becomes subspace itself or an empty set.
             Sampling from the joint distribution on the subspace is realized by multivariate TPE.
+            If ``group`` is :obj:`True`, ``multivariate`` must be :obj:`True` as well.
 
             .. note::
                 Added in v2.8.0 as an experimental feature. The interface may change in newer
@@ -182,217 +201,308 @@ class TPESampler(BaseSampler):
                 sampler = optuna.samplers.TPESampler(multivariate=True, group=True)
                 study = optuna.create_study(sampler=sampler)
                 study.optimize(objective, n_trials=10)
-        warn_independent_sampling:
-            If this is :obj:`True` and ``multivariate=True``, a warning message is emitted when
-            the value of a parameter is sampled by using an independent sampler.
-            If ``multivariate=False``, this flag has no effect.
         constant_liar:
             If :obj:`True`, penalize running trials to avoid suggesting parameter configurations
-            nearby.
+            nearby. Defaults to :obj:`True`.
 
             .. note::
                 Abnormally terminated trials often leave behind a record with a state of
-                `RUNNING` in the storage.
+                ``RUNNING`` in the storage.
                 Such "zombie" trial parameters will be avoided by the constant liar algorithm
                 during subsequent sampling.
                 When using an :class:`~optuna.storages.RDBStorage`, it is possible to enable the
                 ``heartbeat_interval`` to change the records for abnormally terminated trials to
-                `FAIL`.
+                ``FAIL``.
+        constraints_func:
+            An optional function that computes the objective constraints. It must take a
+            :class:`~optuna.trial.FrozenTrial` and return the constraints. The return value must
+            be a sequence of :obj:`float` s. A value strictly larger than 0 means that a
+            constraints is violated. A value equal to or smaller than 0 is considered feasible.
+            If ``constraints_func`` returns more than one value for a trial, that trial is
+            considered feasible if and only if all values are equal to 0 or smaller.
+
+            The ``constraints_func`` will be evaluated after each successful trial.
+            The function won't be called when trials fail or they are pruned, but this behavior is
+            subject to change in the future releases.
+
+            .. warning::
+                Deprecated in v5.0.0. This feature will be removed in the future. The removal of
+                this feature is currently scheduled for v7.0.0, but this schedule is subject to
+                change. Use :meth:`~optuna.trial.Trial.set_constraint` instead.
+                See https://github.com/optuna/optuna/releases/tag/v5.0.0.
+        consider_prior:
+            Enhance the stability of Parzen estimator by imposing a Gaussian prior when
+            :obj:`True`. The prior is only effective if the sampling distribution is
+            either :class:`~optuna.distributions.FloatDistribution`,
+            or :class:`~optuna.distributions.IntDistribution`.
+
+            .. warning::
+                Deprecated in v4.3.0. ``consider_prior`` argument will be removed in the future.
+                The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                From v4.3.0 onward, ``consider_prior`` automatically falls back to ``True``.
+                See https://github.com/optuna/optuna/releases/tag/v4.3.0.
+        prior_weight:
+            The weight of the prior. This argument is used in
+            :class:`~optuna.distributions.FloatDistribution`,
+            :class:`~optuna.distributions.IntDistribution`, and
+            :class:`~optuna.distributions.CategoricalDistribution`.
+
+            .. warning::
+                Deprecated in v4.9.0. ``prior_weight`` argument will be removed in the future.
+                The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                See https://github.com/optuna/optuna/releases/tag/v4.9.0.
+        consider_magic_clip:
+            Enable a heuristic to limit the smallest variances of Gaussians used in
+            the Parzen estimator.
+
+            .. warning::
+                Deprecated in v4.9.0. ``consider_magic_clip`` argument will be removed in the
+                future. The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                See https://github.com/optuna/optuna/releases/tag/v4.9.0.
+        consider_endpoints:
+            Take endpoints of domains into account when calculating variances of Gaussians
+            in Parzen estimator. See the original paper for details on the heuristics
+            to calculate the variances.
+
+            .. warning::
+                Deprecated in v4.9.0. ``consider_endpoints`` argument will be removed in the
+                future. The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                See https://github.com/optuna/optuna/releases/tag/v4.9.0.
+        gamma:
+            A function that takes the number of finished trials and returns the number
+            of trials to form a density function for samples with low grains.
+            See the original paper for more details.
+
+            .. warning::
+                Deprecated in v4.9.0. ``gamma`` argument will be removed in the future.
+                The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                See https://github.com/optuna/optuna/releases/tag/v4.9.0.
+        weights:
+            A function that takes the number of finished trials and returns a weight for them.
+            See `Making a Science of Model Search: Hyperparameter Optimization in Hundreds of
+            Dimensions for Vision Architectures
+            <http://proceedings.mlr.press/v28/bergstra13.pdf>`__ for more details.
 
             .. note::
-                It is recommended to set this value to :obj:`True` during distributed
-                optimization to avoid having multiple workers evaluating similar parameter
-                configurations. In particular, if each objective function evaluation is costly
-                and the durations of the running states are significant, and/or the number of
-                workers is high.
+                In the multi-objective case, this argument is only used to compute the weights of
+                bad trials, i.e., trials to construct `g(x)` in the `paper
+                <https://papers.nips.cc/paper/4443-algorithms-for-hyper-parameter-optimization.pdf>`__
+                ). The weights of good trials, i.e., trials to construct `l(x)`, are uniform.
 
-            .. note::
-                Added in v2.8.0 as an experimental feature. The interface may change in newer
-                versions without prior notice. See
-                https://github.com/optuna/optuna/releases/tag/v2.8.0.
+            .. warning::
+                Deprecated in v4.9.0. ``weights`` argument will be removed in the future.
+                The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                See https://github.com/optuna/optuna/releases/tag/v4.9.0.
+        warn_independent_sampling:
+            If this is :obj:`True` and ``multivariate=True``, a warning message is emitted when
+            the value of a parameter is sampled by using an independent sampler.
+            If ``multivariate=False``, this flag has no effect.
 
-    Raises:
-        ValueError:
-            If ``multivariate`` is :obj:`False` and ``group`` is :obj:`True`.
+            .. warning::
+                Deprecated in v4.9.0. ``warn_independent_sampling`` argument will be removed in
+                the future. The removal of this feature is currently scheduled for v6.0.0,
+                but this schedule is subject to change.
+                See https://github.com/optuna/optuna/releases/tag/v4.9.0.
     """
 
+    @convert_positional_args(
+        previous_positional_arg_names=[
+            "self",
+            "consider_prior",
+            "prior_weight",
+            "consider_magic_clip",
+            "consider_endpoints",
+            "n_startup_trials",
+            "n_ei_candidates",
+            "gamma",
+            "weights",
+            "seed",
+        ],
+        deprecated_version="4.4.0",
+        removed_version="6.0.0",
+    )
     def __init__(
         self,
-        consider_prior: bool = True,
-        prior_weight: float = 1.0,
-        consider_magic_clip: bool = True,
-        consider_endpoints: bool = False,
+        *,
+        consider_prior: bool | None = None,
+        prior_weight: float | None = None,
+        consider_magic_clip: bool | None = None,
+        consider_endpoints: bool | None = None,
         n_startup_trials: int = 10,
         n_ei_candidates: int = 24,
-        gamma: Callable[[int], int] = default_gamma,
-        weights: Callable[[int], np.ndarray] = default_weights,
-        seed: Optional[int] = None,
-        *,
-        multivariate: bool = False,
+        gamma: Callable[[int], int] | None = None,
+        weights: Callable[[int], np.ndarray] | None = None,
+        seed: int | None = None,
+        multivariate: bool | None = None,
         group: bool = False,
-        warn_independent_sampling: bool = True,
-        constant_liar: bool = False,
+        warn_independent_sampling: bool | None = None,
+        constant_liar: bool = True,
+        constraints_func: Callable[[FrozenTrial], Sequence[float]] | None = None,
     ) -> None:
+        consider_prior = _warn_if_deprecated_argument(
+            "`consider_prior`", consider_prior, True, "4.3.0", "6.0.0"
+        )
+        prior_weight = _warn_if_deprecated_argument(
+            "`prior_weight`", prior_weight, 1.0, "4.9.0", "6.0.0"
+        )
+        consider_magic_clip = _warn_if_deprecated_argument(
+            "`consider_magic_clip`", consider_magic_clip, True, "4.9.0", "6.0.0"
+        )
+        consider_endpoints = _warn_if_deprecated_argument(
+            "`consider_endpoints`", consider_endpoints, False, "4.9.0", "6.0.0"
+        )
+        gamma = _warn_if_deprecated_argument("`gamma`", gamma, None, "4.9.0", "6.0.0")
+        weights = _warn_if_deprecated_argument(
+            "`weights`", weights, default_weights, "4.9.0", "6.0.0"
+        )
+        warn_independent_sampling = _warn_if_deprecated_argument(
+            "`warn_independent_sampling`", warn_independent_sampling, False, "4.9.0", "6.0.0"
+        )
 
         self._parzen_estimator_parameters = _ParzenEstimatorParameters(
-            consider_prior,
-            prior_weight,
-            consider_magic_clip,
-            consider_endpoints,
-            weights,
-            multivariate,
+            prior_weight=prior_weight,
+            consider_magic_clip=consider_magic_clip,
+            consider_endpoints=consider_endpoints,
+            weights=weights,
+            # The ``multivariate`` field remains only for historical reasons and is unused,
+            # so any value is fine here.
+            multivariate=True,
         )
-        self._prior_weight = prior_weight
+
         self._n_startup_trials = n_startup_trials
         self._n_ei_candidates = n_ei_candidates
         self._gamma = gamma
-        self._weights = weights
 
         self._warn_independent_sampling = warn_independent_sampling
-        self._rng = np.random.RandomState(seed)
+        self._rng = LazyRandomState(seed)
         self._random_sampler = RandomSampler(seed=seed)
 
-        self._multivariate = multivariate
+        self._multivariate: bool | None = multivariate
         self._group = group
-        self._group_decomposed_search_space: Optional[_GroupDecomposedSearchSpace] = None
-        self._search_space_group: Optional[_SearchSpaceGroup] = None
+        self._group_decomposed_search_space: _GroupDecomposedSearchSpace | None = None
+        self._search_space_group: _SearchSpaceGroup | None = None
         self._search_space = IntersectionSearchSpace(include_pruned=True)
         self._constant_liar = constant_liar
-
-        if multivariate:
-            warnings.warn(
-                "``multivariate`` option is an experimental feature."
-                " The interface can change in the future.",
-                ExperimentalWarning,
-            )
+        self._constraints_func = constraints_func
+        # NOTE(nabenabe0928): Users can overwrite _ParzenEstimator to customize the TPE behavior.
+        self._parzen_estimator_cls = _ParzenEstimator
 
         if group:
-            if not multivariate:
+            if multivariate is False:
                 raise ValueError(
                     "``group`` option can only be enabled when ``multivariate`` is enabled."
                 )
-            warnings.warn(
-                "``group`` option is an experimental feature."
-                " The interface can change in the future.",
-                ExperimentalWarning,
-            )
+            warn_experimental_argument("group")
             self._group_decomposed_search_space = _GroupDecomposedSearchSpace(True)
 
-        if constant_liar:
-            warnings.warn(
-                "``constant_liar`` option is an experimental feature."
-                " The interface can change in the future.",
-                ExperimentalWarning,
+        if constraints_func is not None:
+            msg = _deprecated._DEPRECATION_WARNING_TEMPLATE.format(
+                name="`constraints_func`", d_ver="5.0.0", r_ver="7.0.0"
             )
+            optuna_warn(f"{msg} Use `optuna.trial.Trial.set_constraint` instead.", FutureWarning)
 
     def reseed_rng(self) -> None:
-
-        self._rng = np.random.RandomState()
+        self._rng.rng.seed()
         self._random_sampler.reseed_rng()
+
+    def _is_multivariate(self, study: Study) -> bool:
+        if self._multivariate is not None:
+            return self._multivariate
+        if self._group:
+            # ``group`` can only be enabled with the multivariate TPE.
+            if study._is_multi_objective():
+                optuna_warn(
+                    "``multivariate`` defaults to False for multi-objective optimization, but"
+                    " it is treated as True because ``group`` can only be enabled with the"
+                    " multivariate TPE. Set ``multivariate=True`` explicitly to suppress this"
+                    " warning."
+                )
+            return True
+        # By default, the multivariate TPE is used for single-objective optimization and
+        # the independent TPE is used for multi-objective optimization.
+        return not study._is_multi_objective()
 
     def infer_relative_search_space(
         self, study: Study, trial: FrozenTrial
-    ) -> Dict[str, BaseDistribution]:
-
-        if not self._multivariate:
+    ) -> dict[str, BaseDistribution]:
+        multivariate = self._is_multivariate(study)
+        if not multivariate:
             return {}
 
-        search_space: Dict[str, BaseDistribution] = {}
+        search_space: dict[str, BaseDistribution] = {}
+        use_trial_cache = multivariate or not self._constant_liar
 
         if self._group:
             assert self._group_decomposed_search_space is not None
-            self._search_space_group = self._group_decomposed_search_space.calculate(study)
+            self._search_space_group = self._group_decomposed_search_space.calculate(
+                study, use_trial_cache
+            )
             for sub_space in self._search_space_group.search_spaces:
-                for name, distribution in sub_space.items():
+                # Sort keys because Python's string hashing is nondeterministic.
+                for name, distribution in sorted(sub_space.items()):
                     if distribution.single():
                         continue
                     search_space[name] = distribution
             return search_space
 
-        for name, distribution in self._search_space.calculate(study).items():
+        for name, distribution in self._search_space.calculate(study, use_trial_cache).items():
             if distribution.single():
                 continue
             search_space[name] = distribution
 
         return search_space
 
-    def _log_independent_sampling(
-        self, n_complete_trials: int, trial: FrozenTrial, param_name: str
-    ) -> None:
-        if self._warn_independent_sampling and self._multivariate:
-            # The first trial samples independently.
-            if n_complete_trials >= max(self._n_startup_trials, 1):
-                _logger.warning(
-                    f"The parameter '{param_name}' in trial#{trial.number} is sampled "
-                    "independently instead of being sampled by multivariate TPE sampler. "
-                    "(optimization performance may be degraded). "
-                    "You can suppress this warning by setting `warn_independent_sampling` "
-                    "to `False` in the constructor of `TPESampler`, "
-                    "if this independent sampling is intended behavior."
-                )
-
     def sample_relative(
-        self, study: Study, trial: FrozenTrial, search_space: Dict[str, BaseDistribution]
-    ) -> Dict[str, Any]:
-
+        self, study: Study, trial: FrozenTrial, search_space: dict[str, BaseDistribution]
+    ) -> dict[str, Any]:
         if self._group:
             assert self._search_space_group is not None
             params = {}
             for sub_space in self._search_space_group.search_spaces:
-                search_space = {}
-                for name, distribution in sub_space.items():
-                    if not distribution.single():
-                        search_space[name] = distribution
-                params.update(self._sample_relative(study, trial, search_space))
-            return params
+                _search_space = {}
+                # Sort keys because Python's string hashing is nondeterministic.
+                for name, distribution in sorted(sub_space.items()):
+                    if distribution.single():
+                        continue
+                    if name not in search_space:
+                        # When used together with PartialFixedSampler, the search space may be
+                        # smaller than what is inferred from the study.
+                        continue
+                    _search_space[name] = distribution
+                params.update(self._sample_relative(study, trial, _search_space))
         else:
-            return self._sample_relative(study, trial, search_space)
+            params = self._sample_relative(study, trial, search_space)
+
+        if params != {} and self._constant_liar:
+            # Share the params obtained by the relative sampling with the other processes.
+            params_str = json.dumps(params)
+            for i in range(0, len(params_str), _SYSTEM_ATTR_MAX_LENGTH):
+                study._storage.set_trial_system_attr(
+                    trial._trial_id,
+                    f"{_RELATIVE_PARAMS_KEY}:{i // _SYSTEM_ATTR_MAX_LENGTH}",
+                    params_str[i : i + _SYSTEM_ATTR_MAX_LENGTH],
+                )
+        return params
 
     def _sample_relative(
-        self, study: Study, trial: FrozenTrial, search_space: Dict[str, BaseDistribution]
-    ) -> Dict[str, Any]:
-
+        self, study: Study, trial: FrozenTrial, search_space: dict[str, BaseDistribution]
+    ) -> dict[str, Any]:
         if search_space == {}:
             return {}
 
-        param_names = list(search_space.keys())
-        values, scores = _get_observation_pairs(
-            study, param_names, self._multivariate, self._constant_liar
-        )
-
+        states = (TrialState.COMPLETE, TrialState.PRUNED)
+        trials = study._get_trials(deepcopy=False, states=states, use_cache=True)
         # If the number of samples is insufficient, we run random trial.
-        n = len(scores)
-        if n < self._n_startup_trials:
+        if len(trials) < self._n_startup_trials:
             return {}
 
-        # We divide data into below and above.
-        indices_below, indices_above = _split_observation_pairs(scores, self._gamma(n))
-        # `None` items are intentionally converted to `nan` and then filtered out.
-        # For `nan` conversion, the dtype must be float.
-        config_values = {k: np.asarray(v, dtype=float) for k, v in values.items()}
-        below = _build_observation_dict(config_values, indices_below)
-        above = _build_observation_dict(config_values, indices_above)
-
-        # We then sample by maximizing log likelihood ratio.
-        if study._is_multi_objective():
-            weights_below = _calculate_weights_below_for_multi_objective(
-                config_values, scores, indices_below
-            )
-            mpe_below = _ParzenEstimator(
-                below, search_space, self._parzen_estimator_parameters, weights_below
-            )
-        else:
-            mpe_below = _ParzenEstimator(below, search_space, self._parzen_estimator_parameters)
-        mpe_above = _ParzenEstimator(above, search_space, self._parzen_estimator_parameters)
-        samples_below = mpe_below.sample(self._rng, self._n_ei_candidates)
-        log_likelihoods_below = mpe_below.log_pdf(samples_below)
-        log_likelihoods_above = mpe_above.log_pdf(samples_below)
-        ret = TPESampler._compare(samples_below, log_likelihoods_below, log_likelihoods_above)
-
-        for param_name, dist in search_space.items():
-            ret[param_name] = dist.to_external_repr(ret[param_name])
-
-        return ret
+        return self._sample(study, trial, search_space)
 
     def sample_independent(
         self,
@@ -401,78 +511,169 @@ class TPESampler(BaseSampler):
         param_name: str,
         param_distribution: BaseDistribution,
     ) -> Any:
+        states = (TrialState.COMPLETE, TrialState.PRUNED)
+        trials = study._get_trials(deepcopy=False, states=states, use_cache=True)
 
-        values, scores = _get_observation_pairs(
-            study, [param_name], self._multivariate, self._constant_liar
-        )
-
-        n = len(scores)
-
-        self._log_independent_sampling(n, trial, param_name)
-
-        if n < self._n_startup_trials:
+        # If the number of samples is insufficient, we run random trial.
+        if len(trials) < self._n_startup_trials:
             return self._random_sampler.sample_independent(
                 study, trial, param_name, param_distribution
             )
 
-        indices_below, indices_above = _split_observation_pairs(scores, self._gamma(n))
-        # `None` items are intentionally converted to `nan` and then filtered out.
-        # For `nan` conversion, the dtype must be float.
-        config_values = {k: np.asarray(v, dtype=float) for k, v in values.items()}
-        below = _build_observation_dict(config_values, indices_below)
-        above = _build_observation_dict(config_values, indices_above)
+        if self._warn_independent_sampling and self._is_multivariate(study):
+            # Avoid independent warning at the first sampling of `param_name`.
+            if any(param_name in trial.params for trial in trials):
+                _logger.warning(
+                    _INDEPENDENT_SAMPLING_WARNING_TEMPLATE.format(
+                        param_name=param_name,
+                        trial_number=trial.number,
+                        independent_sampler_name=self._random_sampler.__class__.__name__,
+                        sampler_name=self.__class__.__name__,
+                        fallback_reason=(
+                            "`multivariate=True,group=False` does not support dynamic search space"
+                            " (but `multivariate=True,group=True` works)"
+                        ),
+                    )
+                )
 
-        if study._is_multi_objective():
-            weights_below = _calculate_weights_below_for_multi_objective(
-                config_values, scores, indices_below
-            )
-            mpe_below = _ParzenEstimator(
-                below,
-                {param_name: param_distribution},
-                self._parzen_estimator_parameters,
-                weights_below,
+        return self._sample(study, trial, {param_name: param_distribution})[param_name]
+
+    def _get_params(self, trial: FrozenTrial, study: Study) -> dict[str, Any]:
+        if trial.state.is_finished() or not self._is_multivariate(study):
+            # NOTE(not522): If not multivariate, `relative_params` does not exist and
+            # `system_attrs` access will be unnecessary, so we skip it.
+            return trial.params
+
+        params_strs = []
+        i = 0
+        while params_str_i := trial.system_attrs.get(f"{_RELATIVE_PARAMS_KEY}:{i}"):
+            params_strs.append(params_str_i)
+            i += 1
+
+        if len(params_strs) == 0:
+            return trial.params
+        try:
+            params = json.loads("".join(params_strs))
+        except json.JSONDecodeError:
+            # A race condition can occur when multiple workers write chunks
+            # concurrently. If the JSON is incomplete, fall back to trial.params.
+            return trial.params
+        params.update(trial.params)
+        return params
+
+    def _get_internal_repr(
+        self, trials: list[FrozenTrial], search_space: dict[str, BaseDistribution], study: Study
+    ) -> dict[str, np.ndarray]:
+        values: dict[str, list[float]] = {param_name: [] for param_name in search_space}
+        for trial in trials:
+            params = self._get_params(trial, study)
+            if search_space.keys() <= params.keys():
+                for param_name, distribution in search_space.items():
+                    param = params[param_name]
+                    values[param_name].append(distribution.to_internal_repr(param))
+        return {k: np.asarray(v) for k, v in values.items()}
+
+    def _sample(
+        self, study: Study, trial: FrozenTrial, search_space: dict[str, BaseDistribution]
+    ) -> dict[str, Any]:
+        if self._constant_liar:
+            states = [TrialState.COMPLETE, TrialState.PRUNED, TrialState.RUNNING]
+        else:
+            states = [TrialState.COMPLETE, TrialState.PRUNED]
+        use_cache = not self._constant_liar
+        trials = study._get_trials(deepcopy=False, states=states, use_cache=use_cache)
+
+        if self._constant_liar:
+            # For constant_liar, filter out the current trial.
+            trials = [t for t in trials if trial.number != t.number]
+
+        # We divide data into below and above.
+        if self._gamma is None:
+            if len(study.directions) <= 1:
+                self._gamma = default_gamma
+            else:
+                self._gamma = default_gamma_multiobjective
+        # Ignore running trials. See https://github.com/optuna/optuna/pull/4073.
+        n = sum(trial.state != TrialState.RUNNING for trial in trials)
+
+        below_trials, above_trials = _split_trials(
+            study,
+            trials,
+            self._gamma(n),
+        )
+
+        mpe_below = self._build_parzen_estimator(
+            study, search_space, below_trials, handle_below=True
+        )
+        mpe_above = self._build_parzen_estimator(
+            study, search_space, above_trials, handle_below=False
+        )
+
+        samples_below = mpe_below.sample(self._rng.rng, self._n_ei_candidates)
+        acq_func_vals = self._compute_acquisition_func(samples_below, mpe_below, mpe_above)
+        ret = TPESampler._compare(samples_below, acq_func_vals)
+
+        for param_name, dist in search_space.items():
+            ret[param_name] = dist.to_external_repr(ret[param_name])
+
+        return ret
+
+    def _build_parzen_estimator(
+        self,
+        study: Study,
+        search_space: dict[str, BaseDistribution],
+        trials: list[FrozenTrial],
+        handle_below: bool,
+    ) -> _ParzenEstimator:
+        observations = self._get_internal_repr(trials, search_space, study)
+        if handle_below and study._is_multi_objective():
+            n_below = len(next(iter(observations.values()))) if observations else 0
+            weights_below = np.ones(n_below)
+            mpe = self._parzen_estimator_cls(
+                observations, search_space, self._parzen_estimator_parameters, weights_below
             )
         else:
-            mpe_below = _ParzenEstimator(
-                below, {param_name: param_distribution}, self._parzen_estimator_parameters
+            mpe = self._parzen_estimator_cls(
+                observations, search_space, self._parzen_estimator_parameters
             )
-        mpe_above = _ParzenEstimator(
-            above, {param_name: param_distribution}, self._parzen_estimator_parameters
-        )
-        samples_below = mpe_below.sample(self._rng, self._n_ei_candidates)
-        log_likelihoods_below = mpe_below.log_pdf(samples_below)
-        log_likelihoods_above = mpe_above.log_pdf(samples_below)
-        ret = TPESampler._compare(samples_below, log_likelihoods_below, log_likelihoods_above)
 
-        return param_distribution.to_external_repr(ret[param_name])
+        if not isinstance(mpe, _ParzenEstimator):
+            raise RuntimeError("_parzen_estimator_cls must override _ParzenEstimator.")
+
+        return mpe
+
+    def _compute_acquisition_func(
+        self,
+        samples: dict[str, np.ndarray],
+        mpe_below: _ParzenEstimator,
+        mpe_above: _ParzenEstimator,
+    ) -> np.ndarray:
+        log_likelihoods_below = mpe_below.log_pdf(samples)
+        log_likelihoods_above = mpe_above.log_pdf(samples)
+        acq_func_vals = log_likelihoods_below - log_likelihoods_above
+        return acq_func_vals
 
     @classmethod
     def _compare(
-        cls,
-        samples: Dict[str, np.ndarray],
-        log_l: np.ndarray,
-        log_g: np.ndarray,
-    ) -> Dict[str, Union[float, int]]:
-
+        cls, samples: dict[str, np.ndarray], acquisition_func_vals: np.ndarray
+    ) -> dict[str, int | float]:
         sample_size = next(iter(samples.values())).size
-        if sample_size:
-            score = log_l - log_g
-            if sample_size != score.size:
-                raise ValueError(
-                    "The size of the 'samples' and that of the 'score' "
-                    "should be same. "
-                    "But (samples.size, score.size) = ({}, {})".format(sample_size, score.size)
-                )
-            best = np.argmax(score)
-            return {k: v[best].item() for k, v in samples.items()}
-        else:
+        if sample_size == 0:
+            raise ValueError(f"The size of `samples` must be positive, but got {sample_size}.")
+
+        if sample_size != acquisition_func_vals.size:
             raise ValueError(
-                "The size of 'samples' should be more than 0."
-                "But samples.size = {}".format(sample_size)
+                "The sizes of `samples` and `acquisition_func_vals` must be same, but got "
+                "(samples.size, acquisition_func_vals.size) = "
+                f"({sample_size}, {acquisition_func_vals.size})."
             )
 
+        best_idx = np.argmax(acquisition_func_vals)
+        return {k: v[best_idx].item() for k, v in samples.items()}
+
     @staticmethod
-    def hyperopt_parameters() -> Dict[str, Any]:
+    @_deprecated.deprecated_func("4.9.0", "6.0.0")
+    def hyperopt_parameters() -> dict[str, Any]:
         """Return the the default parameters of hyperopt (v0.1.2).
 
         :class:`~optuna.samplers.TPESampler` can be instantiated with the parameters returned
@@ -481,7 +682,7 @@ class TPESampler(BaseSampler):
         Example:
 
             Create a :class:`~optuna.samplers.TPESampler` instance with the default
-            parameters of `hyperopt <https://github.com/hyperopt/hyperopt/tree/0.1.2>`_.
+            parameters of `hyperopt <https://github.com/hyperopt/hyperopt/tree/0.1.2>`__.
 
             .. testcode::
 
@@ -491,7 +692,7 @@ class TPESampler(BaseSampler):
 
                 def objective(trial):
                     x = trial.suggest_float("x", -10, 10)
-                    return x ** 2
+                    return x**2
 
 
                 sampler = TPESampler(**TPESampler.hyperopt_parameters())
@@ -514,281 +715,167 @@ class TPESampler(BaseSampler):
             "weights": default_weights,
         }
 
+    def before_trial(self, study: Study, trial: FrozenTrial) -> None:
+        self._random_sampler.before_trial(study, trial)
+
     def after_trial(
         self,
         study: Study,
         trial: FrozenTrial,
         state: TrialState,
-        values: Optional[Sequence[float]],
+        values: Sequence[float] | None,
     ) -> None:
-
+        assert state in [TrialState.COMPLETE, TrialState.FAIL, TrialState.PRUNED]
+        if self._constraints_func is not None:
+            _process_constraints_after_trial(self._constraints_func, study, trial, state)
         self._random_sampler.after_trial(study, trial, state, values)
 
 
-def _calculate_nondomination_rank(loss_vals: np.ndarray) -> np.ndarray:
-    vecs = loss_vals.copy()
-
-    # Normalize values
-    lb = vecs.min(axis=0, keepdims=True)
-    ub = vecs.max(axis=0, keepdims=True)
-    vecs = (vecs - lb) / (ub - lb)
-
-    ranks = np.zeros(len(vecs))
-    num_unranked = len(vecs)
-    rank = 0
-    while num_unranked > 0:
-        extended = np.tile(vecs, (vecs.shape[0], 1, 1))
-        counts = np.sum(
-            np.logical_and(
-                np.all(extended <= np.swapaxes(extended, 0, 1), axis=2),
-                np.any(extended < np.swapaxes(extended, 0, 1), axis=2),
-            ),
-            axis=1,
-        )
-        vecs[counts == 0] = 1.1  # mark as ranked
-        ranks[counts == 0] = rank
-        rank += 1
-        num_unranked -= np.sum(counts == 0)
-    return ranks
+def _get_reference_point(loss_vals: np.ndarray) -> np.ndarray:
+    worst_point = np.max(loss_vals, axis=0)
+    reference_point = np.maximum(1.1 * worst_point, 0.9 * worst_point)
+    reference_point[reference_point == 0] = EPS
+    return reference_point
 
 
-def _get_observation_pairs(
-    study: Study,
-    param_names: List[str],
-    multivariate: bool,
-    constant_liar: bool = False,  # TODO(hvy): Remove default value and fix unit tests.
-) -> Tuple[Dict[str, List[Optional[float]]], List[Tuple[float, List[float]]]]:
-    """Get observation pairs from the study.
+def _split_trials(
+    study: Study, trials: list[FrozenTrial], n_below: int
+) -> tuple[list[FrozenTrial], list[FrozenTrial]]:
+    complete_trials = []
+    pruned_trials = []
+    running_trials = []
+    infeasible_trials = []
 
-    This function collects observation pairs from the complete or pruned trials of the study.
-    In addition, if ``constant_liar`` is :obj:`True`, the running trials are considered.
-    The values for trials that don't contain the parameter in the ``param_names`` are skipped.
-
-    An observation pair fundamentally consists of a parameter value and an objective value.
-    However, due to the pruning mechanism of Optuna, final objective values are not always
-    available. Therefore, this function uses intermediate values in addition to the final
-    ones, and reports the value with its step count as ``(-step, value)``.
-    Consequently, the structure of the observation pair is as follows:
-    ``(param_value, (-step, value))``.
-
-    The second element of an observation pair is used to rank observations in
-    ``_split_observation_pairs`` method (i.e., observations are sorted lexicographically by
-    ``(-step, value)``).
-    """
-
-    if len(param_names) > 1:
-        assert multivariate
-
-    signs = []
-    for d in study.directions:
-        if d == StudyDirection.MINIMIZE:
-            signs.append(1)
-        else:
-            signs.append(-1)
-
-    states: Tuple[TrialState, ...]
-    if constant_liar:
-        states = (TrialState.COMPLETE, TrialState.PRUNED, TrialState.RUNNING)
-    else:
-        states = (TrialState.COMPLETE, TrialState.PRUNED)
-
-    scores = []
-    values: Dict[str, List[Optional[float]]] = {param_name: [] for param_name in param_names}
-    for trial in study.get_trials(deepcopy=False, states=states):
-        # If ``multivariate`` = True and ``group`` = True, we ignore the trials that are not
-        # included in each subspace.
-        # If ``multivariate`` = False, we skip the check.
-        if multivariate and any([param_name not in trial.params for param_name in param_names]):
-            continue
-
-        # We extract score from the trial.
-        if trial.state is TrialState.COMPLETE:
-            if trial.values is None:
-                continue
-            score = (-float("inf"), [sign * v for sign, v in zip(signs, trial.values)])
-        elif trial.state is TrialState.PRUNED:
-            if study._is_multi_objective():
-                continue
-
-            if len(trial.intermediate_values) > 0:
-                step, intermediate_value = max(trial.intermediate_values.items())
-                if math.isnan(intermediate_value):
-                    score = (-step, [float("inf")])
-                else:
-                    score = (-step, [signs[0] * intermediate_value])
-            else:
-                score = (float("inf"), [0.0])
-        elif trial.state is TrialState.RUNNING:
-            if study._is_multi_objective():
-                continue
-
-            assert constant_liar
-            score = (-float("inf"), [signs[0] * float("inf")])
+    for trial in trials:
+        if trial.state == TrialState.RUNNING:
+            # We should check if the trial is RUNNING before the feasibility check
+            # because its constraint values have not yet been set.
+            running_trials.append(trial)
+        elif _get_infeasible_trial_score(trial) > 0:
+            infeasible_trials.append(trial)
+        elif trial.state == TrialState.COMPLETE:
+            complete_trials.append(trial)
+        elif trial.state == TrialState.PRUNED:
+            pruned_trials.append(trial)
         else:
             assert False
-        scores.append(score)
 
-        # We extract param_value from the trial.
-        for param_name in param_names:
-            raw_param_value = trial.params.get(param_name, None)
-            param_value: Optional[float]
-            if raw_param_value is not None:
-                distribution = trial.distributions[param_name]
-                param_value = distribution.to_internal_repr(trial.params[param_name])
-            else:
-                param_value = None
-            values[param_name].append(param_value)
+    # We divide data into below and above.
+    below_complete, above_complete = _split_complete_trials(complete_trials, study, n_below)
+    # This ensures `n_below` is non-negative to prevent unexpected trial splits.
+    n_below = max(0, n_below - len(below_complete))
+    below_pruned, above_pruned = _split_pruned_trials(pruned_trials, study, n_below)
+    # This ensures `n_below` is non-negative to prevent unexpected trial splits.
+    n_below = max(0, n_below - len(below_pruned))
+    below_infeasible, above_infeasible = _split_infeasible_trials(infeasible_trials, n_below)
 
-    return values, scores
+    below_trials = below_complete + below_pruned + below_infeasible
+    above_trials = above_complete + above_pruned + above_infeasible + running_trials
+    below_trials.sort(key=lambda trial: trial.number)
+    above_trials.sort(key=lambda trial: trial.number)
+
+    return below_trials, above_trials
 
 
-def _split_observation_pairs(
-    loss_vals: List[Tuple[float, List[float]]],
-    n_below: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-
-    n_objectives = 1
-    if len(loss_vals) > 0:
-        n_objectives = len(loss_vals[0][1])
-
-    if n_objectives <= 1:
-        loss_values = np.asarray(
-            [(s, v[0]) for s, v in loss_vals], dtype=[("step", float), ("score", float)]
-        )
-
-        index_loss_ascending = np.argsort(loss_values)
-        # `np.sort` is used to keep chronological order.
-        indices_below = np.sort(index_loss_ascending[:n_below])
-        indices_above = np.sort(index_loss_ascending[n_below:])
+def _split_complete_trials(
+    trials: Sequence[FrozenTrial], study: Study, n_below: int
+) -> tuple[list[FrozenTrial], list[FrozenTrial]]:
+    n_below = min(n_below, len(trials))
+    if len(study.directions) <= 1:
+        return _split_complete_trials_single_objective(trials, study, n_below)
     else:
-        # Multi-objective TPE does not support pruning, so it ignores the ``step``.
-        lvals = np.asarray([v for _, v in loss_vals])
-
-        # Solving HSSP for variables number of times is a waste of time.
-        nondomination_ranks = _calculate_nondomination_rank(lvals)
-        assert 0 <= n_below <= len(lvals)
-
-        indices = np.array(range(len(lvals)))
-        indices_below = np.empty(n_below, dtype=int)
-
-        # Nondomination rank-based selection
-        i = 0
-        last_idx = 0
-        while last_idx + sum(nondomination_ranks == i) <= n_below:
-            length = indices[nondomination_ranks == i].shape[0]
-            indices_below[last_idx : last_idx + length] = indices[nondomination_ranks == i]
-            last_idx += length
-            i += 1
-
-        # Hypervolume subset selection problem (HSSP)-based selection
-        subset_size = n_below - last_idx
-        if subset_size > 0:
-            rank_i_lvals = lvals[nondomination_ranks == i]
-            rank_i_indices = indices[nondomination_ranks == i]
-            worst_point = np.max(rank_i_lvals, axis=0)
-            reference_point = np.maximum(1.1 * worst_point, 0.9 * worst_point)
-            reference_point[reference_point == 0] = EPS
-            selected_indices = _solve_hssp(
-                rank_i_lvals, rank_i_indices, subset_size, reference_point
-            )
-            indices_below[last_idx:] = selected_indices
-
-        indices_above = np.setdiff1d(indices, indices_below)
-
-    return indices_below, indices_above
+        return _split_complete_trials_multi_objective(trials, study, n_below)
 
 
-def _build_observation_dict(
-    config_values: Dict[str, np.ndarray], indices: np.ndarray
-) -> Dict[str, np.ndarray]:
-
-    observation_dict = {}
-    for param_name, param_val in config_values.items():
-        param_values = param_val[indices]
-        observation_dict[param_name] = param_values[~np.isnan(param_values)]
-
-    return observation_dict
+def _split_complete_trials_single_objective(
+    trials: Sequence[FrozenTrial], study: Study, n_below: int
+) -> tuple[list[FrozenTrial], list[FrozenTrial]]:
+    if study.direction == StudyDirection.MINIMIZE:
+        sorted_trials = sorted(trials, key=lambda trial: cast("float", trial.value))
+    else:
+        sorted_trials = sorted(trials, key=lambda trial: cast("float", trial.value), reverse=True)
+    return sorted_trials[:n_below], sorted_trials[n_below:]
 
 
-def _compute_hypervolume(solution_set: np.ndarray, reference_point: np.ndarray) -> float:
-    return WFG().compute(solution_set, reference_point)
-
-
-def _solve_hssp(
-    rank_i_loss_vals: np.ndarray,
-    rank_i_indices: np.ndarray,
-    subset_size: int,
-    reference_point: np.ndarray,
-) -> np.ndarray:
-    """Solve a hypervolume subset selection problem (HSSP) via a greedy algorithm.
-
-    This method is a 1-1/e approximation algorithm to solve HSSP.
-
-    For further information about algorithms to solve HSSP, please refer to the following
-    paper:
-
-    - `Greedy Hypervolume Subset Selection in Low Dimensions
-       <https://ieeexplore.ieee.org/document/7570501>`_
-    """
-    selected_vecs = []  # type: List[np.ndarray]
-    selected_indices = []  # type: List[int]
-    contributions = [
-        _compute_hypervolume(np.asarray([v]), reference_point) for v in rank_i_loss_vals
-    ]
-    hv_selected = 0.0
-    while len(selected_indices) < subset_size:
-        max_index = int(np.argmax(contributions))
-        contributions[max_index] = -1  # mark as selected
-        selected_index = rank_i_indices[max_index]
-        selected_vec = rank_i_loss_vals[max_index]
-        for j, v in enumerate(rank_i_loss_vals):
-            if contributions[j] == -1:
-                continue
-            p = np.max([selected_vec, v], axis=0)
-            contributions[j] -= (
-                _compute_hypervolume(np.asarray(selected_vecs + [p]), reference_point)
-                - hv_selected
-            )
-        selected_vecs += [selected_vec]
-        selected_indices += [selected_index]
-        hv_selected = _compute_hypervolume(np.asarray(selected_vecs), reference_point)
-
-    return np.asarray(selected_indices, dtype=int)
-
-
-def _calculate_weights_below_for_multi_objective(
-    config_values: Dict[str, np.ndarray],
-    loss_vals: List[Tuple[float, List[float]]],
-    indices: np.ndarray,
-) -> np.ndarray:
-    # Multi-objective TPE only sees the first parameter to determine the weights.
-    # In the call lf `sample_relative`, this logic makes sense because we only have the
-    # intersection search space or group decomposed search space. This means one parameter
-    # misses the one trial, then the other parameter must miss the trial, in this call of
-    # `sample_relative`.
-    # In the call of `sample_independent`, we only have one parameter so the logic makes sense.
-    cvals = list(config_values.values())[0][indices]
-
-    # Multi-objective TPE does not support pruning, so it ignores the ``step``.
-    lvals = np.asarray([v for _, v in loss_vals])[indices]
-
-    # Calculate weights based on hypervolume contributions.
-    n_below = len(lvals)
+def _split_complete_trials_multi_objective(
+    trials: Sequence[FrozenTrial], study: Study, n_below: int
+) -> tuple[list[FrozenTrial], list[FrozenTrial]]:
     if n_below == 0:
-        weights_below = np.asarray([])
-    elif n_below == 1:
-        weights_below = np.asarray([1.0])
-    else:
-        worst_point = np.max(lvals, axis=0)
-        reference_point = np.maximum(1.1 * worst_point, 0.9 * worst_point)
-        reference_point[reference_point == 0] = EPS
-        hv = _compute_hypervolume(lvals, reference_point)
-        indices = ~np.eye(n_below).astype(bool)
-        contributions = np.asarray(
-            [hv - _compute_hypervolume(lvals[indices[i]], reference_point) for i in range(n_below)]
-        )
-        contributions += EPS
-        weights_below = np.clip(contributions / np.max(contributions), 0, 1)
+        return [], list(trials)
+    elif n_below == len(trials):
+        return list(trials), []
 
-    weights_below = weights_below[~np.isnan(cvals)]
-    return weights_below
+    assert 0 < n_below < len(trials)
+    lvals = np.array([trial.values for trial in trials])
+    lvals *= [-1.0 if d == StudyDirection.MAXIMIZE else 1.0 for d in study.directions]
+    nondomination_ranks = _fast_non_domination_rank(lvals, n_below=n_below)
+    ranks, rank_counts = np.unique(nondomination_ranks, return_counts=True)
+    last_rank_before_tiebreak = int(np.max(ranks[np.cumsum(rank_counts) <= n_below], initial=-1))
+    assert all(ranks[: last_rank_before_tiebreak + 1] == np.arange(last_rank_before_tiebreak + 1))
+    indices = np.arange(len(trials))
+    indices_below = indices[nondomination_ranks <= last_rank_before_tiebreak]
+
+    if indices_below.size < n_below:  # Tie-break with Hypervolume subset selection problem (HSSP).
+        assert ranks[last_rank_before_tiebreak + 1] == last_rank_before_tiebreak + 1
+        need_tiebreak = nondomination_ranks == last_rank_before_tiebreak + 1
+        rank_i_lvals = lvals[need_tiebreak]
+        subset_size = n_below - indices_below.size
+        selected_indices = _solve_hssp_with_cache(
+            tuple(rank_i_lvals.ravel()),
+            tuple(indices[need_tiebreak]),
+            subset_size,
+            tuple(_get_reference_point(rank_i_lvals)),
+        )
+        indices_below = np.append(indices_below, selected_indices)
+
+    below_indices_set = set(cast("list", indices_below.tolist()))
+    below_trials = [trials[i] for i in range(len(trials)) if i in below_indices_set]
+    above_trials = [trials[i] for i in range(len(trials)) if i not in below_indices_set]
+    return below_trials, above_trials
+
+
+def _get_pruned_trial_score(trial: FrozenTrial, study: Study) -> tuple[float, float]:
+    if len(trial.intermediate_values) > 0:
+        step, intermediate_value = max(trial.intermediate_values.items())
+        if math.isnan(intermediate_value):
+            return -step, float("inf")
+        elif study.direction == StudyDirection.MINIMIZE:
+            return -step, intermediate_value
+        else:
+            return -step, -intermediate_value
+    else:
+        return 1, 0.0
+
+
+def _split_pruned_trials(
+    trials: Sequence[FrozenTrial], study: Study, n_below: int
+) -> tuple[list[FrozenTrial], list[FrozenTrial]]:
+    n_below = min(n_below, len(trials))
+    sorted_trials = sorted(trials, key=lambda trial: _get_pruned_trial_score(trial, study))
+    return sorted_trials[:n_below], sorted_trials[n_below:]
+
+
+def _get_infeasible_trial_score(trial: FrozenTrial) -> float:
+    return sum(v for v in trial.constraints.values() if v > 0)
+
+
+def _split_infeasible_trials(
+    trials: Sequence[FrozenTrial], n_below: int
+) -> tuple[list[FrozenTrial], list[FrozenTrial]]:
+    n_below = min(n_below, len(trials))
+    sorted_trials = sorted(trials, key=_get_infeasible_trial_score)
+    return sorted_trials[:n_below], sorted_trials[n_below:]
+
+
+@lru_cache(maxsize=1)
+def _solve_hssp_with_cache(
+    rank_i_lvals_tuple: tuple[float, ...],
+    rank_i_indices_tuple: tuple[int, ...],
+    subset_size: int,
+    ref_point_tuple: tuple[float, ...],
+) -> np.ndarray:
+    lvals_shape = (len(rank_i_indices_tuple), len(ref_point_tuple))
+    rank_i_lvals = np.reshape(rank_i_lvals_tuple, lvals_shape)
+    rank_i_indices = np.array(rank_i_indices_tuple)
+    ref_point = np.array(ref_point_tuple)
+    return _solve_hssp(rank_i_lvals, rank_i_indices, subset_size, ref_point)
